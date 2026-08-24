@@ -54,6 +54,13 @@ if errorlevel 1 (
 )
 
 REM ------------------------------------------------------------
+REM 2b) Hangi GitHub reposuna baglaniliyor - kullaniciya goster
+REM ------------------------------------------------------------
+echo [BILGI] Bu repo su remote adresine push edecek:
+git remote -v
+echo.
+
+REM ------------------------------------------------------------
 REM 3) Degisiklik var mi kontrol et
 REM ------------------------------------------------------------
 git status --porcelain > "%TEMP%\gitstatus.txt"
@@ -104,14 +111,14 @@ git push
 echo ------------------------------------------------------------
 if errorlevel 1 (
     echo [HATA] Push basarisiz oldu. Internet baglantinizi ve GitHub
-    echo        giris bilgilerinizi (kimlik dogrulama) kontrol edin.
+    echo        giris bilgilerinizi - kimlik dogrulama - kontrol edin.
     echo        Ilk kez push ediyorsaniz asagidaki komutla remote'u ve
     echo        upstream'i ayarlamaniz gerekebilir:
     echo        git push -u origin main
     pause
     exit /b 1
 )
-echo [OK] Push tamamlandi.
+echo [OK] Push tamamlandi. Depo: git remote -v yukarida gosterildi.
 echo.
 
 :ask_release
@@ -123,9 +130,9 @@ REM Release "asset" olarak yuklenmelidir. Bunun icin GitHub CLI (gh)
 REM gereklidir: https://cli.github.com/
 where gh >nul 2>nul
 if errorlevel 1 (
-    echo [BILGI] GitHub CLI (gh) bulunamadi, Release/asset yukleme adimi atlandi.
-    echo         Kurulum .exe'nizi (youtube_indirici_pro.setup.exe^) GitHub
-    echo         sitesinden "Releases -^> Draft a new release" ile elle
+    echo [BILGI] GitHub CLI - gh - bulunamadi, Release/asset yukleme adimi atlandi.
+    echo         Kurulum .exe'nizi - youtube_indirici_pro.setup.exe - GitHub
+    echo         sitesinden Releases -^> Draft a new release ile elle
     echo         yukleyebilir, ya da GitHub CLI kurup bu betigi tekrar
     echo         calistirarak bu adimi da otomatiklestirebilirsiniz:
     echo         https://cli.github.com/

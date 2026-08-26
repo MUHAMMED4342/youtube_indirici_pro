@@ -15,7 +15,6 @@ bir dosyada tutulur ama davranış aynı kalır.
 """
 
 import os
-import re
 import json
 import time
 import random
@@ -28,8 +27,11 @@ from ytdlp_core import (
     YTDLP_EXE, USER_AGENTS, CREATE_NO_WINDOW,
     RETRY_MAX, RETRY_BASE_SLEEP, RETRY_JITTER_MAX,
     BETWEEN_DL_MIN, BETWEEN_DL_MAX,
+    PARALLEL_DOWNLOADS_DEFAULT, PARALLEL_DOWNLOADS_MAX,
     ytdlp_exists, get_ffmpeg_path, bildir,
     cleanup_temp_files, terminate_process_tree,
+    sanitize_filename_part, validate_output_template,
+    validate_speed_limit, validate_proxy,
     DownloadItem, HISTORY_FILE, DOWNLOADED_URLS_FILE, LOG_FILE,
 )
 
@@ -58,7 +60,7 @@ class DownloadEngineMixin:
         Arama (ytsearchN:) ve oynatma listesi analizi için ortak kullanılır.
         """
         if not ytdlp_exists():
-            raise RuntimeError("yt-dlp.exe bulunamadı. Ayarlar sekmesinden indirin/güncelleyin.")
+            raise RuntimeError("İndirme motoru bulunamadı. Ayarlar sekmesinden kurabilirsiniz.")
         args = [
             YTDLP_EXE, '--no-warnings', '--flat-playlist',
             '--dump-single-json', '--skip-download',
@@ -69,7 +71,7 @@ class DownloadEngineMixin:
             creationflags=CREATE_NO_WINDOW)
         if proc.returncode != 0:
             raise RuntimeError(
-                (proc.stderr or proc.stdout or "yt-dlp bilgi alma hatası").strip()[:300])
+                (proc.stderr or proc.stdout or "Video bilgisi alınamadı").strip()[:300])
         return json.loads(proc.stdout)
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -132,11 +134,19 @@ class DownloadEngineMixin:
 
         speed = self.settings.get('speed_limit', '').strip()
         if speed:
-            args += ['--limit-rate', speed]
+            gecerli, _h = validate_speed_limit(speed)
+            if gecerli:
+                args += ['--limit-rate', speed]
+            else:
+                self._log_event(f"Geçersiz hız sınırı ayarı yok sayıldı: {speed!r}")
 
         proxy = self.settings.get('proxy', '').strip()
         if proxy:
-            args += ['--proxy', proxy]
+            gecerli, _h = validate_proxy(proxy)
+            if gecerli:
+                args += ['--proxy', proxy]
+            else:
+                self._log_event(f"Geçersiz proxy ayarı yok sayıldı: {proxy!r}")
 
         is_thumb_only = 'Sadece Kapak' in fmt
 
@@ -240,10 +250,10 @@ class DownloadEngineMixin:
                       çağrısıyla bildirilir.
         """
         if not ytdlp_exists():
-            item.error = "yt-dlp.exe bulunamadı"
+            item.error = "İndirme motoru bulunamadı"
             item.status = "Hata"
             self._ui_update(self._update_row, item, "Hata ✗", "0%", "", "", "")
-            self._log_event("yt-dlp.exe bulunamadı — Ayarlar sekmesinden indirin/güncelleyin.")
+            self._log_event("İndirme motoru bulunamadı — Ayarlar sekmesinden kurun/güncelleyin.")
             return False
 
         self._current_item = item
@@ -251,8 +261,16 @@ class DownloadEngineMixin:
         # Playlist videolarını alt klasöre ve numaralı olarak kaydet
         user_template = self.settings.get('output_template', '%(title)s.%(ext)s').strip() \
             or '%(title)s.%(ext)s'
+        # Ayar dosyası elle düzenlenmiş olabilir; kaydetme sırasında yapılan
+        # doğrulamayı burada da tekrar ederek geçersiz bir şablonun diskte
+        # beklenmedik bir konuma yazmasını önlüyoruz.
+        gecerli, _hata = validate_output_template(user_template)
+        if not gecerli:
+            self._log_event(
+                f"Geçersiz dosya adı şablonu tespit edildi, varsayılana dönülüyor: {user_template!r}")
+            user_template = '%(title)s.%(ext)s'
         if item.playlist_title:
-            safe_pl = re.sub(r'[\\/*?:"<>|]', '_', item.playlist_title)[:60]
+            safe_pl = sanitize_filename_part(item.playlist_title)[:60]
             outtmpl = os.path.join(
                 self.settings['dir'], safe_pl,
                 f"{item.playlist_idx:03d} - {user_template}")
@@ -292,10 +310,10 @@ class DownloadEngineMixin:
                     text=True, bufsize=1, universal_newlines=True,
                     creationflags=CREATE_NO_WINDOW)
             except Exception as exc:
-                item.error = f"yt-dlp.exe çalıştırılamadı: {exc}"
+                item.error = f"İndirme motoru çalıştırılamadı: {exc}"
                 item.status = "Hata"
                 self._ui_update(self._update_row, item, "Hata ✗", item.progress, "", "", attempt_label)
-                self._log_event(f"yt-dlp.exe çalıştırma hatası: {exc}")
+                self._log_event(f"İndirme motoru çalıştırma hatası: {exc}")
                 return False
 
             phase = self._read_download_phase(
@@ -519,10 +537,10 @@ class DownloadEngineMixin:
             return "RETRY"
 
         else:
-            item.error  = err_str[:120]
+            item.error  = err_str[:300]
             item.status = "Hata"
             self._ui_update(self._update_row, item, "Hata ✗", item.progress, "", "", attempt_label)
-            self._log_event(f"Hata: {url[:60]} — {err_str[:100]}")
+            self._log_event(f"Hata: {url[:60]} — {err_str[:300]}")
             self._ui_update(self.speaker.say, f"Hata: {item.title[:35]}", 0)
             # Kalıcı hata sonrası yarım kalan geçici dosyaları temizle.
             removed = cleanup_temp_files(target_dir)
@@ -655,7 +673,7 @@ class DownloadEngineMixin:
             item.playlist_title = pl_title
             item.playlist_idx   = pl_idx
             item.playlist_total = pl_total
-            self.download_items[url] = item
+            self.download_items[idx] = item
             self._ui_update(self.queue_list.InsertItem, idx, display)
             self._ui_update(self.queue_list.SetItem, idx, 1, "Kuyrukta")
             self._ui_update(self.queue_list.SetItem, idx, 2, "0%")
@@ -666,35 +684,84 @@ class DownloadEngineMixin:
         self._ui_update(self.speaker.say, f"{summary_prefix} — indirme başlıyor.", 0)
 
         # ── 3. Adım: İndirme döngüsü ─────────────────────────────────────────
-        for idx, (url, pl_title, pl_idx, pl_total) in enumerate(expanded):
-            if self.stop_event.is_set():
-                self._log_event("Kullanıcı tarafından durduruldu.")
-                break
+        parallel_n = self.settings.get('parallel_downloads', PARALLEL_DOWNLOADS_DEFAULT)
+        try:
+            parallel_n = int(parallel_n)
+        except (TypeError, ValueError):
+            parallel_n = PARALLEL_DOWNLOADS_DEFAULT
+        parallel_n = max(1, min(parallel_n, PARALLEL_DOWNLOADS_MAX))
 
-            item = self.download_items[url]
+        if parallel_n <= 1:
+            # Varsayılan ve ÖNERİLEN davranış: videolar sırayla, aralarında
+            # kısa bir bekleme ile indirilir. Bu, mevcut/eski davranışla
+            # birebir aynıdır — kullanıcı paralel indirmeyi kendisi
+            # açmadığı sürece hiçbir şey değişmez.
+            for idx, (url, pl_title, pl_idx, pl_total) in enumerate(expanded):
+                if self.stop_event.is_set():
+                    self._log_event("Kullanıcı tarafından durduruldu.")
+                    break
 
-            result = self._download_single(url, item, fmt)
+                item = self.download_items[idx]
+                result = self._download_single(url, item, fmt)
 
-            if result == "PENDING":
-                # Bu videonun dönüştürmesi arka planda sürüyor; sayaçlar ve
-                # ilerleme çubuğu, o thread bittiğinde on_item_done ile
-                # otomatik güncellenecek — burada BEKLENMİYOR, kuyruk hemen
-                # bir sonraki videoya geçiyor.
-                pass
-            else:
-                on_item_done(url, item, bool(result))
+                if result == "PENDING":
+                    # Bu videonun dönüştürmesi arka planda sürüyor; sayaçlar ve
+                    # ilerleme çubuğu, o thread bittiğinde on_item_done ile
+                    # otomatik güncellenecek — burada BEKLENMİYOR, kuyruk hemen
+                    # bir sonraki videoya geçiyor.
+                    pass
+                else:
+                    on_item_done(url, item, bool(result))
 
-            if idx < total - 1 and not self.stop_event.is_set():
-                mn = self.settings.get('between_dl_min', BETWEEN_DL_MIN)
-                mx = self.settings.get('between_dl_max', BETWEEN_DL_MAX)
-                wait = random.uniform(mn, mx)
-                self._ui_update(self.speaker.say,
-                                f"Sonraki video için {wait:.1f}s bekleniyor.", 0)
-                deadline = time.time() + wait
-                while time.time() < deadline:
+                if idx < total - 1 and not self.stop_event.is_set():
+                    mn = self.settings.get('between_dl_min', BETWEEN_DL_MIN)
+                    mx = self.settings.get('between_dl_max', BETWEEN_DL_MAX)
+                    wait = random.uniform(mn, mx)
+                    self._ui_update(self.speaker.say,
+                                    f"Sonraki video için {wait:.1f}s bekleniyor.", 0)
+                    deadline = time.time() + wait
+                    while time.time() < deadline:
+                        if self.stop_event.is_set():
+                            break
+                        time.sleep(0.3)
+        else:
+            # Kullanıcı, Ayarlar sekmesinden bilinçli olarak "Aynı Anda
+            # İndirilecek Video Sayısı"nı 1'in üzerine çıkardı. En fazla
+            # `parallel_n` video aynı anda indirilir. Her indirmenin başlangıcı
+            # tam olarak aynı ana denk gelmesin diye küçük, rastgele bir
+            # gecikme uygulanır.
+            self._ui_update(
+                self.speaker.say,
+                f"Aynı anda en fazla {parallel_n} video indirilecek.", 0)
+
+            dl_semaphore = threading.BoundedSemaphore(parallel_n)
+            dl_threads = []
+
+            def worker(url, item):
+                dl_semaphore.acquire()
+                try:
                     if self.stop_event.is_set():
-                        break
-                    time.sleep(0.3)
+                        return
+                    time.sleep(random.uniform(0, 2.0))
+                    if self.stop_event.is_set():
+                        return
+                    result = self._download_single(url, item, fmt)
+                    if result != "PENDING":
+                        on_item_done(url, item, bool(result))
+                finally:
+                    dl_semaphore.release()
+
+            for idx, (url, pl_title, pl_idx, pl_total) in enumerate(expanded):
+                if self.stop_event.is_set():
+                    self._log_event("Kullanıcı tarafından durduruldu.")
+                    break
+                item = self.download_items[idx]
+                t = threading.Thread(target=worker, args=(url, item), daemon=True)
+                dl_threads.append(t)
+                t.start()
+
+            for t in dl_threads:
+                t.join()
 
         # Arka planda hâlâ dönüştürülmekte olan videolar varsa, özet ve
         # bildirim gösterilmeden önce bitmelerini bekle.

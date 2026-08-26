@@ -28,7 +28,6 @@ import threading
 import queue
 import os
 import subprocess
-import json
 import random
 from datetime import datetime
 
@@ -36,9 +35,14 @@ from ytdlp_core import (
     SETTINGS_FILE, HISTORY_FILE, LOG_FILE, DOWNLOADED_URLS_FILE,
     KISAYOLLAR, USER_AGENTS, RETRY_MAX, BETWEEN_DL_MIN, BETWEEN_DL_MAX,
     CREATE_NO_WINDOW, YTDLP_EXE,
-    ytdlp_exists, download_ytdlp_exe, get_ytdlp_version, get_ffmpeg_path,
+    PARALLEL_DOWNLOADS_DEFAULT, PARALLEL_DOWNLOADS_MAX,
+    LOG_MAX_ENTRIES, HISTORY_MAX_ENTRIES,
+    ytdlp_exists, download_ytdlp_exe, get_ytdlp_version,
+    get_ffmpeg_status_message,
     is_valid_url, normalize_urls, bildir,
-    StatusSpeaker, DownloadItem,
+    safe_load_json, safe_save_json,
+    validate_output_template, validate_speed_limit, validate_proxy,
+    StatusSpeaker, DownloadItem, YtdlpDogrulamaHatasi,
 )
 from download_engine import DownloadEngineMixin
 
@@ -154,7 +158,7 @@ class YouTubeDownloader(wx.Frame, DownloadEngineMixin):
             size=(740, 680),
         )
 
-        self.settings = self._load(SETTINGS_FILE, {
+        self.settings, ayar_bozuk = self._load(SETTINGS_FILE, {
             'dir': os.path.expanduser('~\\Downloads'),
             'playlist': False,
             'embed_meta': True,
@@ -171,11 +175,22 @@ class YouTubeDownloader(wx.Frame, DownloadEngineMixin):
             'output_template': '%(title)s.%(ext)s',
             'minimize_tray': False,
             'skip_duplicates': True,
-        })
-        self.history          = self._load(HISTORY_FILE, [])
-        self.log              = self._load(LOG_FILE, [])
-        self.downloaded_urls: set = set(self._load(DOWNLOADED_URLS_FILE, []))
-        self.download_items: dict[str, DownloadItem] = {}
+            # Aynı anda kaç video indirileceği. Varsayılan ve ÖNERİLEN değer
+            # 1'dir (kapalı / sırayla). Daha yüksek bir değer indirmeleri
+            # hızlandırabilir ama YouTube'un hız sınırlamasına (çok sayıda
+            # video "Bekliyor" durumuna düşmesi) yakalanma ihtimalini artırır.
+            'parallel_downloads': PARALLEL_DOWNLOADS_DEFAULT,
+        }, return_status=True)
+        self.history, gecmis_bozuk = self._load(HISTORY_FILE, [], return_status=True)
+        self.log, gunluk_bozuk     = self._load(LOG_FILE, [], return_status=True)
+        indirilenler, adres_bozuk  = self._load(DOWNLOADED_URLS_FILE, [], return_status=True)
+        self.downloaded_urls: set = set(indirilenler)
+        self._bozuk_dosya_uyarisi = ayar_bozuk or gecmis_bozuk or gunluk_bozuk or adres_bozuk
+        # NOT: Anahtar olarak URL DEĞİL, kuyruktaki sıra numarası (idx)
+        # kullanılır. Aynı video adresi iki farklı oynatma listesinde (veya
+        # aynı kuyrukta) birden fazla kez geçebilir; URL'yi anahtar yapmak bu
+        # durumda ögelerin kuyrukta birbirinin üzerine yazılmasına yol açar.
+        self.download_items: dict[int, DownloadItem] = {}
         self.failed_urls: list = []
         self.stop_event       = threading.Event()
         self.active           = False
@@ -208,32 +223,45 @@ class YouTubeDownloader(wx.Frame, DownloadEngineMixin):
         self._setup_tray_icon()
         self.Show()
 
+        if getattr(self, '_bozuk_dosya_uyarisi', False):
+            bildir(
+                self,
+                "Bazı kayıtlı dosyalarınız (ayarlar, geçmiş veya günlük) okunamadığı için "
+                "sıfırdan başlatıldı. Eski hâlleri güvenlik amacıyla klasörünüzde "
+                "\".bozuk-\" ile başlayan bir yedek olarak saklandı, silinmedi.",
+                "Bilgi", wx.ICON_INFORMATION)
+
         if self.settings.get('auto_clipboard'):
             self._clipboard_timer.Start(1500)
 
-        # İlk çalıştırmada yt-dlp.exe yoksa GitHub'dan arka planda indir
+        # İlk çalıştırmada indirme motoru yoksa arka planda otomatik kur
         self._ytdlp_busy = False
         if not ytdlp_exists():
-            self.speaker.say("yt-dlp.exe bulunamadı, GitHub'dan indiriliyor...", 0)
+            self.speaker.say("Program ilk kez hazırlanıyor, lütfen bekleyin...", 0)
             self._ytdlp_busy = True
             threading.Thread(target=self._auto_download_ytdlp_on_start, daemon=True).start()
 
     # ── JSON yardımcıları ─────────────────────────────────────────────────────
-    def _load(self, path, default):
-        if os.path.exists(path):
-            try:
-                with open(path, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except Exception:
-                pass
-        return default
+    def _load(self, path, default, return_status: bool = False):
+        """
+        Bir ayar/geçmiş/günlük dosyasını okur. Dosya bozuksa sessizce
+        sıfırlamak yerine bozuk dosyayı ".bozuk-<zaman>" olarak yedekler ve
+        (varsa) bunu çağırana bildirir — bkz. safe_load_json.
+        """
+        bozuldu, veri = safe_load_json(path, default)
+        if return_status:
+            return veri, bozuldu
+        return veri
 
     def _save(self, path, data):
-        try:
-            with open(path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=4, ensure_ascii=False)
-        except Exception as e:
-            self._log_event(f"Kayıt hatası: {e}")
+        # Geçmiş / günlük listelerinin sınırsız büyümesini önlemek için
+        # kaydetmeden hemen önce en eski kayıtları buda.
+        if path == HISTORY_FILE and isinstance(data, list) and len(data) > HISTORY_MAX_ENTRIES:
+            data = data[-HISTORY_MAX_ENTRIES:]
+        elif path == LOG_FILE and isinstance(data, list) and len(data) > LOG_MAX_ENTRIES:
+            data = data[-LOG_MAX_ENTRIES:]
+        if not safe_save_json(path, data):
+            self._log_event(f"Kayıt hatası: {path} dosyasına yazılamadı.")
 
     def _build_download_tab(self):
         panel = wx.Panel(self.notebook)
@@ -454,7 +482,7 @@ class YouTubeDownloader(wx.Frame, DownloadEngineMixin):
         sizer.Add(hbox_speed, 0, wx.ALL | wx.EXPAND, 10)
 
         # İndirmeler arası bekleme
-        sizer.Add(wx.StaticText(panel, label="İndirmeler Arası Bekleme Süresi (HTTP 429'a karşı koruma):"),
+        sizer.Add(wx.StaticText(panel, label="İndirmeler Arası Bekleme Süresi (YouTube'un sizi geçici olarak engellemesini önler):"),
                   0, wx.LEFT | wx.TOP, 10)
         hbox_wait = wx.BoxSizer(wx.HORIZONTAL)
         hbox_wait.Add(wx.StaticText(panel, label="Min. saniye:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
@@ -470,6 +498,24 @@ class YouTubeDownloader(wx.Frame, DownloadEngineMixin):
         self.spin_max.SetToolTip("Ardışık iki indirme arasındaki maksimum bekleme süresi (saniye).")
         hbox_wait.Add(self.spin_max, 0)
         sizer.Add(hbox_wait, 0, wx.ALL, 10)
+
+        # Aynı anda indirme (paralel indirme) — varsayılan ve önerilen: kapalı (1)
+        sizer.Add(wx.StaticText(panel, label="Aynı Anda İndirilecek Video Sayısı:"),
+                  0, wx.LEFT | wx.TOP, 10)
+        hbox_parallel = wx.BoxSizer(wx.HORIZONTAL)
+        self.spin_parallel = wx.SpinCtrl(
+            panel, min=1, max=PARALLEL_DOWNLOADS_MAX,
+            value=str(self.settings.get('parallel_downloads', PARALLEL_DOWNLOADS_DEFAULT)),
+            name="Aynı anda indirme sayısı")
+        self.spin_parallel.SetToolTip(
+            "Önerilen: 1 (kapalı / sırayla indirme). Bunu artırmak indirmeleri hızlandırabilir, "
+            "ama YouTube'un sizi geçici olarak engellemesi ihtimalini de artırır. "
+            "Sorun yaşarsanız 1'e geri döndürün.")
+        hbox_parallel.Add(self.spin_parallel, 0, wx.RIGHT, 10)
+        hbox_parallel.Add(
+            wx.StaticText(panel, label="(Önerilen: 1 — çoğu kullanıcı bu ayarı değiştirmemelidir)"),
+            0, wx.ALIGN_CENTER_VERTICAL)
+        sizer.Add(hbox_parallel, 0, wx.ALL, 10)
 
         # Onay kutuları
         checks = [
@@ -577,29 +623,29 @@ class YouTubeDownloader(wx.Frame, DownloadEngineMixin):
         btn_save.Bind(wx.EVT_BUTTON, self._on_save_settings)
         sizer.Add(btn_save, 0, wx.ALL | wx.EXPAND, 10)
 
-        ffmpeg = get_ffmpeg_path()
-        ff_msg = ("FFmpeg BULUNDU — Ses/video dönüştürme ve etiket özellikleri aktif."
-                  if ffmpeg else
-                  "UYARI: FFmpeg bulunamadı — ffmpeg.exe ve ffprobe.exe dosyalarını program klasörüne kopyalayın.")
-        lbl_ff = wx.StaticText(panel, label=ff_msg, name="FFmpeg durum etiketi")
+        ffmpeg_ok, ff_msg = get_ffmpeg_status_message()
+        lbl_ff = wx.StaticText(panel, label=ff_msg, name="Video birleştirme bileşeni durum etiketi")
+        if not ffmpeg_ok:
+            lbl_ff.SetForegroundColour(wx.Colour(180, 90, 0))
         sizer.Add(lbl_ff, 0, wx.ALL, 10)
 
-        # ── yt-dlp motoru: durum ve güncelleme ──────────────────────────────
+        # ── İndirme motoru: durum ve güncelleme ─────────────────────────────
         sizer.Add(wx.StaticLine(panel), 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
         sizer.Add(wx.StaticText(panel, label=""), 0, wx.BOTTOM, 2)
 
         self.lbl_ytdlp = wx.StaticText(
-            panel, label=self._ytdlp_status_text(), name="yt-dlp durum etiketi")
+            panel, label=self._ytdlp_status_text(), name="İndirme motoru durum etiketi")
         self.lbl_ytdlp.SetToolTip(
-            "İndirme motoru olarak kullanılan yt-dlp.exe dosyasının durumu ve sürümü.")
+            "Videoları indirmek için kullanılan arka plan bileşeninin durumu ve sürümü.")
         sizer.Add(self.lbl_ytdlp, 0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
 
         self.btn_update_ytdlp = wx.Button(
-            panel, label="yt-dlp'yi Güncelle / İndir  (GitHub)",
-            name="yt-dlp güncelle butonu")
+            panel, label="İndirme Motorunu Güncelle",
+            name="İndirme motorunu güncelle butonu")
         self.btn_update_ytdlp.SetToolTip(
-            "yt-dlp.exe programını GitHub'daki resmi yt-dlp/yt-dlp deposundan "
-            "en güncel sürüme günceller. Dosya hiç indirilmemişse önce indirir.")
+            "Videoları indirmek için kullanılan bileşeni resmi kaynağından en güncel "
+            "sürüme günceller. Hiç indirilmemişse önce indirir. Dosyanın bütünlüğü "
+            "otomatik olarak doğrulanır.")
         self.btn_update_ytdlp.Bind(wx.EVT_BUTTON, self._on_update_ytdlp)
         sizer.Add(self.btn_update_ytdlp, 0, wx.ALL | wx.EXPAND, 10)
 
@@ -608,9 +654,9 @@ class YouTubeDownloader(wx.Frame, DownloadEngineMixin):
 
     def _ytdlp_status_text(self) -> str:
         if not ytdlp_exists():
-            return ("yt-dlp motoru: BULUNAMADI — aşağıdaki butonla GitHub'dan indirin.")
+            return "İndirme motoru: kurulu değil — aşağıdaki butonla indirebilirsiniz."
         ver = get_ytdlp_version()
-        return f"yt-dlp motoru sürümü: {ver or 'bilinmiyor'}   ({YTDLP_EXE})"
+        return f"İndirme motoru sürümü: {ver or 'bilinmiyor'} — hazır."
 
     # ─────────────────────────────────────────────────────────────────────────
     # SEKME 3: GEÇMİŞ
@@ -793,8 +839,8 @@ class YouTubeDownloader(wx.Frame, DownloadEngineMixin):
     def _on_start(self, event):
         if not ytdlp_exists():
             bildir(self,
-                   "yt-dlp motoru (yt-dlp.exe) henüz indirilmedi.\n"
-                   "Ayarlar sekmesinden 'yt-dlp'yi Güncelle / İndir' butonuna basın.",
+                   "İndirme motoru henüz hazır değil.\n"
+                   "Ayarlar sekmesinden \"İndirme Motorunu Güncelle\" butonuna basın.",
                    "Uyarı", wx.ICON_WARNING)
             self.notebook.SetSelection(1)
             return
@@ -876,24 +922,46 @@ class YouTubeDownloader(wx.Frame, DownloadEngineMixin):
         if mn > mx:
             bildir(self, "Minimum bekleme süresi, maksimum değerden büyük olamaz.", "Hata", wx.ICON_ERROR)
             return
+
         template = self.txt_template.GetValue().strip() or '%(title)s.%(ext)s'
+        gecerli, hata = validate_output_template(template)
+        if not gecerli:
+            bildir(self, f"Dosya adı şablonu geçersiz:\n{hata}", "Hata", wx.ICON_ERROR)
+            self.txt_template.SetFocus()
+            return
+
+        speed = self.txt_speed.GetValue().strip()
+        gecerli, hata = validate_speed_limit(speed)
+        if not gecerli:
+            bildir(self, hata, "Hata", wx.ICON_ERROR)
+            self.txt_speed.SetFocus()
+            return
+
+        proxy = self.txt_proxy.GetValue().strip()
+        gecerli, hata = validate_proxy(proxy)
+        if not gecerli:
+            bildir(self, hata, "Hata", wx.ICON_ERROR)
+            self.txt_proxy.SetFocus()
+            return
+
         self.settings.update({
-            'dir':             self.dir_picker.GetPath(),
-            'playlist':        self.chk_playlist.GetValue(),
-            'embed_meta':      self.chk_meta.GetValue(),
-            'speed_limit':     self.txt_speed.GetValue().strip(),
-            'notifications':   self.chk_notifications.GetValue(),
-            'auto_clipboard':  self.chk_auto_clipboard.GetValue(),
-            'between_dl_min':  mn,
-            'between_dl_max':  mx,
-            'subtitles':       self.chk_subtitles.GetValue(),
-            'subtitle_langs':  self.txt_sub_langs.GetValue().strip() or 'tr,en',
-            'subtitle_embed':  self.chk_sub_embed.GetValue(),
-            'sponsorblock':    self.chk_sponsorblock.GetValue(),
-            'proxy':           self.txt_proxy.GetValue().strip(),
-            'output_template': template,
-            'skip_duplicates': self.chk_skip_dup.GetValue(),
-            'minimize_tray':   self.chk_minimize_tray.GetValue() if self.chk_minimize_tray else False,
+            'dir':                self.dir_picker.GetPath(),
+            'playlist':           self.chk_playlist.GetValue(),
+            'embed_meta':         self.chk_meta.GetValue(),
+            'speed_limit':        speed,
+            'notifications':      self.chk_notifications.GetValue(),
+            'auto_clipboard':     self.chk_auto_clipboard.GetValue(),
+            'between_dl_min':     mn,
+            'between_dl_max':     mx,
+            'subtitles':          self.chk_subtitles.GetValue(),
+            'subtitle_langs':     self.txt_sub_langs.GetValue().strip() or 'tr,en',
+            'subtitle_embed':     self.chk_sub_embed.GetValue(),
+            'sponsorblock':       self.chk_sponsorblock.GetValue(),
+            'proxy':              proxy,
+            'output_template':    template,
+            'skip_duplicates':    self.chk_skip_dup.GetValue(),
+            'minimize_tray':      self.chk_minimize_tray.GetValue() if self.chk_minimize_tray else False,
+            'parallel_downloads': self.spin_parallel.GetValue(),
         })
         self._save(SETTINGS_FILE, self.settings)
         if self.settings['auto_clipboard']:
@@ -936,17 +1004,24 @@ class YouTubeDownloader(wx.Frame, DownloadEngineMixin):
             self._ytdlp_progress_dlg = None
 
     def _auto_download_ytdlp_on_start(self):
-        """Program ilk açıldığında yt-dlp.exe yoksa klasik indirme penceresiyle indirir."""
-        self._ui_update(self._ui_open_ytdlp_dialog, "yt-dlp Motoru İndiriliyor")
+        """Program ilk açıldığında indirme motoru bulunamazsa, klasik indirme
+        penceresiyle otomatik olarak kurar."""
+        self._ui_update(self._ui_open_ytdlp_dialog, "İndirme Motoru Hazırlanıyor")
         try:
             download_ytdlp_exe(progress_cb=self._ytdlp_progress_cb)
-            self._log_event("yt-dlp.exe GitHub'dan otomatik olarak indirildi (ilk çalıştırma).")
-            self._ui_update(self.speaker.say, "yt-dlp.exe hazır. İndirmeye başlayabilirsiniz.", 0)
-        except Exception as exc:
-            self._log_event(f"yt-dlp.exe otomatik indirme hatası: {exc}")
+            self._log_event("İndirme motoru ilk çalıştırmada otomatik olarak kuruldu.")
+            self._ui_update(self.speaker.say, "Her şey hazır. İndirmeye başlayabilirsiniz.", 0)
+        except YtdlpDogrulamaHatasi as exc:
+            self._log_event(f"İndirme motoru bütünlük doğrulaması başarısız: {exc}")
             self._ui_update(
                 self.speaker.say,
-                "yt-dlp.exe otomatik indirilemedi. Ayarlar sekmesinden manuel deneyin.", 0)
+                "İndirilen dosya güvenlik denetiminden geçemedi ve silindi. "
+                "Ayarlar sekmesinden tekrar deneyebilirsiniz.", 0)
+        except Exception as exc:
+            self._log_event(f"İndirme motoru otomatik kurulum hatası: {exc}")
+            self._ui_update(
+                self.speaker.say,
+                "İndirme motoru otomatik kurulamadı. Ayarlar sekmesinden tekrar deneyebilirsiniz.", 0)
         finally:
             self._ytdlp_busy = False
             self._ui_update(self._close_ytdlp_progress_dialog)
@@ -962,50 +1037,53 @@ class YouTubeDownloader(wx.Frame, DownloadEngineMixin):
 
     def _on_update_ytdlp(self, event):
         if self._ytdlp_busy:
-            bildir(self, "yt-dlp motoru şu anda indiriliyor/güncelleniyor, lütfen bekleyin.", "Bilgi")
+            bildir(self, "İndirme motoru şu anda kuruluyor/güncelleniyor, lütfen bekleyin.", "Bilgi")
             return
         self._ytdlp_busy = True
         self.btn_update_ytdlp.Disable()
 
         # Klasik indirme penceresini aç; indirme bitene kadar açık kalır
-        self._ytdlp_progress_dlg = self._open_ytdlp_progress_dialog("yt-dlp Güncelleniyor")
-        self._ytdlp_progress_dlg.set_progress(None, "GitHub'a bağlanılıyor...")
-        self.speaker.say("yt-dlp motoru güncelleniyor / indiriliyor...", 0)
+        self._ytdlp_progress_dlg = self._open_ytdlp_progress_dialog("İndirme Motoru Güncelleniyor")
+        self._ytdlp_progress_dlg.set_progress(None, "Bağlanılıyor...")
+        self.speaker.say("İndirme motoru güncelleniyor / kuruluyor...", 0)
         threading.Thread(target=self._update_ytdlp_worker, daemon=True).start()
 
     def _update_ytdlp_worker(self):
         try:
             if not ytdlp_exists():
-                self._ui_update(self._apply_ytdlp_progress, None, "yt-dlp.exe GitHub'dan indiriliyor...")
+                self._ui_update(self._apply_ytdlp_progress, None, "İndirme motoru kuruluyor...")
                 download_ytdlp_exe(progress_cb=self._ytdlp_progress_cb)
-                self._log_event("yt-dlp.exe GitHub'dan ilk kez indirildi.")
-                result_msg = "yt-dlp.exe başarıyla indirildi."
+                self._log_event("İndirme motoru ilk kez kuruldu.")
+                result_msg = "İndirme motoru başarıyla kuruldu."
             else:
-                # Önce yt-dlp'nin kendi resmi güncelleme mekanizmasını dene (-U)
+                # Önce dahili güncelleme mekanizmasını dene
                 self._ui_update(self._apply_ytdlp_progress, None, "Güncelleme kontrol ediliyor...")
                 proc = subprocess.run(
                     [YTDLP_EXE, '-U'], capture_output=True, text=True,
                     timeout=90, creationflags=CREATE_NO_WINDOW)
                 out = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
-                self._log_event(f"yt-dlp güncelleme çıktısı: {out[:200]}")
+                self._log_event(f"İndirme motoru güncelleme çıktısı: {out[:200]}")
                 if proc.returncode == 0:
-                    result_msg = out or "yt-dlp zaten güncel."
+                    result_msg = "İndirme motoru zaten güncel." if not out else out
                     self._ui_update(self._apply_ytdlp_progress, 100, "Güncel.")
                 else:
-                    # -U bazı durumlarda çalışmayabilir; GitHub'dan yeniden indir
+                    # Dahili güncelleme bazı durumlarda çalışmayabilir; yeniden indir
                     self._ui_update(
                         self._apply_ytdlp_progress, None,
-                        "Dahili güncelleme başarısız, GitHub'dan yeniden indiriliyor...")
+                        "Dahili güncelleme başarısız, yeniden kuruluyor...")
                     download_ytdlp_exe(progress_cb=self._ytdlp_progress_cb)
-                    self._log_event("yt-dlp.exe GitHub'dan yeniden indirilerek güncellendi.")
-                    result_msg = "yt-dlp.exe GitHub'dan yeniden indirilerek güncellendi."
+                    self._log_event("İndirme motoru yeniden indirilerek güncellendi.")
+                    result_msg = "İndirme motoru yeniden indirilerek güncellendi."
 
             ver = get_ytdlp_version()
             self._ui_update(
                 self._on_ytdlp_update_done, True,
                 f"{result_msg}\n\nGüncel sürüm: {ver or 'bilinmiyor'}")
+        except YtdlpDogrulamaHatasi as exc:
+            self._log_event(f"İndirme motoru bütünlük doğrulaması başarısız: {exc}")
+            self._ui_update(self._on_ytdlp_update_done, False, str(exc))
         except Exception as exc:
-            self._log_event(f"yt-dlp güncelleme hatası: {exc}")
+            self._log_event(f"İndirme motoru güncelleme hatası: {exc}")
             self._ui_update(self._on_ytdlp_update_done, False, str(exc))
 
     def _on_ytdlp_update_done(self, success: bool, msg: str):
@@ -1014,11 +1092,11 @@ class YouTubeDownloader(wx.Frame, DownloadEngineMixin):
         self._refresh_ytdlp_label()
         self._close_ytdlp_progress_dialog()
         if success:
-            self.speaker.say("yt-dlp güncelleme işlemi tamamlandı.", 0)
-            bildir(self, msg, "yt-dlp Güncelleme")
+            self.speaker.say("Güncelleme tamamlandı.", 0)
+            bildir(self, msg, "Güncelleme Tamamlandı")
         else:
-            self.speaker.say("yt-dlp güncelleme işlemi başarısız oldu.", 0)
-            bildir(self, f"Güncelleme sırasında hata oluştu:\n{msg[:300]}", "Hata", wx.ICON_ERROR)
+            self.speaker.say("Güncelleme işlemi başarısız oldu.", 0)
+            bildir(self, f"Güncelleme sırasında bir sorun oluştu:\n{msg[:300]}", "Hata", wx.ICON_ERROR)
 
     def _on_open_folder(self, event):
         folder = self.settings.get('dir', os.getcwd())

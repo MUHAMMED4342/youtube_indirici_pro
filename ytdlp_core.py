@@ -16,6 +16,7 @@ import wx
 import os
 import sys
 import re
+import shutil
 import random
 import hashlib
 import threading
@@ -130,8 +131,11 @@ def _fetch_ytdlp_expected_sha256() -> str | None:
             text = resp.read().decode('utf-8', errors='ignore')
         for line in text.splitlines():
             line = line.strip()
-            if line.lower().endswith('yt-dlp.exe') and len(line) >= 64:
-                return line.split()[0].strip().lower()
+            parts = line.split()
+            if len(parts) >= 2:
+                fn = parts[-1].lstrip('*').lower()
+                if fn == 'yt-dlp.exe' and len(parts[0]) == 64:
+                    return parts[0].strip().lower()
     except Exception:
         pass
     return None
@@ -215,6 +219,7 @@ def get_ytdlp_version():
         proc = subprocess.run(
             [YTDLP_EXE, '--version'],
             capture_output=True, text=True, timeout=15,
+            encoding='utf-8', errors='replace',
             creationflags=CREATE_NO_WINDOW)
         return proc.stdout.strip() or None
     except Exception:
@@ -223,11 +228,41 @@ def get_ytdlp_version():
 
 # ── Yardımcı fonksiyonlar ─────────────────────────────────────────────────────
 def get_ffmpeg_path():
-    base = sys._MEIPASS if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
-    ffmpeg  = os.path.join(base, "ffmpeg.exe")
-    ffprobe = os.path.join(base, "ffprobe.exe")
-    if os.path.exists(ffmpeg) and os.path.exists(ffprobe):
-        return base
+    """
+    Sistemde veya uygulama dizinlerinde ffmpeg.exe dosyasını arar:
+      1. PyInstaller _MEIPASS (paket içi)
+      2. Exe'nin bulunduğu klasör (PyInstaller onedir kökü)
+      3. Komut dosyasının bulunduğu klasör (geliştirme ortamı)
+      4. AppData bin klasörü (%APPDATA%\\YouTubeIndiriciPro\\bin)
+      5. Windows sistem PATH (kullanıcının bilgisayarında kurulu ffmpeg)
+    Bulunursa ffmpeg'in bulunduğu klasör yolunu, bulunamazsa None döndürür.
+    """
+    # 1. PyInstaller paket içi
+    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+        base = sys._MEIPASS
+        if os.path.exists(os.path.join(base, "ffmpeg.exe")):
+            return base
+
+    # 2. Exe dizini (onedir)
+    if getattr(sys, 'frozen', False):
+        exe_dir = os.path.dirname(sys.executable)
+        if os.path.exists(os.path.join(exe_dir, "ffmpeg.exe")):
+            return exe_dir
+
+    # 3. Kaynak kod dizini
+    src_dir = os.path.dirname(os.path.abspath(__file__))
+    if os.path.exists(os.path.join(src_dir, "ffmpeg.exe")):
+        return src_dir
+
+    # 4. AppData bin dizini
+    if os.path.exists(os.path.join(YTDLP_DIR, "ffmpeg.exe")):
+        return YTDLP_DIR
+
+    # 5. Sistem PATH
+    ffmpeg_bin = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
+    if ffmpeg_bin:
+        return os.path.dirname(os.path.abspath(ffmpeg_bin))
+
     return None
 
 
@@ -236,9 +271,9 @@ def get_ffmpeg_status_message() -> tuple[bool, str]:
     içermeyen bir cümleyle döndürür: (kurulu_mu, mesaj)."""
     if get_ffmpeg_path():
         return True, "Video birleştirme bileşeni hazır — yüksek kaliteli indirmeler sorunsuz çalışacaktır."
-    return False, ("Video birleştirme bileşeni eksik. Bazı yüksek kaliteli formatlar "
-                    "(görüntü ve sesin ayrı indirilip birleştirilmesi gerekenler) çalışmayabilir. "
-                    "Yardım menüsünden \"Eksik Bileşeni Tamamla\" seçeneğini kullanabilirsiniz.")
+    return False, ("Video birleştirme bileşeni (FFmpeg) bulunamadı. Bazı yüksek kaliteli formatlar "
+                   "(görüntü ve sesin ayrı indirilip birleştirilmesi gerekenler) çalışmayabilir. "
+                   "FFmpeg'i sisteminize kurabilir veya programın bin klasörüne ekleyebilirsiniz.")
 
 
 # ── Ayar / geçmiş / günlük dosyalarını güvenli okuma-yazma ──────────────────
@@ -433,30 +468,29 @@ def cleanup_temp_files(directory: str) -> list:
     """
     Verilen klasördeki yt-dlp'ye ait yarım kalmış geçici/parça dosyalarını
     (.part, .ytdl, .part-FragNN.part, birleştirilmemiş .webm/.m4a/.mp4 parça
-    dosyaları vb.) siler. İndirmeler sıralı (tek tek) yapıldığı için bu
-    temizlik yalnızca iptal edilen veya kalıcı olarak başarısız olan indirme
-    için diskte kalan dosyaları hedefler; başka bir indirmeyle çakışma riski
-    yoktur.
-
-    Silinen dosya yollarının listesini döndürür (loglama için kullanılabilir).
+    dosyaları vb.) siler.
     """
     removed = []
     if not directory or not os.path.isdir(directory):
         return removed
-    try:
-        for name in os.listdir(directory):
-            if not _is_leftover_temp_file(name):
-                continue
-            full = os.path.join(directory, name)
-            if not os.path.isfile(full):
-                continue
-            try:
-                os.remove(full)
-                removed.append(full)
-            except OSError:
-                pass  # Dosya hâlâ kilitliyse sessizce geç, uygulamayı bozma
-    except OSError:
-        pass
+    import time
+    for attempt in range(2):
+        if attempt > 0:
+            time.sleep(0.2)
+        try:
+            for name in os.listdir(directory):
+                if not _is_leftover_temp_file(name):
+                    continue
+                full = os.path.join(directory, name)
+                if not os.path.isfile(full) or full in removed:
+                    continue
+                try:
+                    os.remove(full)
+                    removed.append(full)
+                except OSError:
+                    pass  # Dosya kilitliyse sonraki denemeye veya sessizce geç
+        except OSError:
+            pass
     return removed
 
 
@@ -464,12 +498,6 @@ def terminate_process_tree(proc: subprocess.Popen) -> None:
     """
     Bir yt-dlp.exe sürecini VE onun başlattığı alt süreçleri (özellikle
     ffmpeg.exe birleştirme/dönüştürme sırasında) birlikte sonlandırır.
-
-    Sadece proc.terminate() çağırmak yalnızca yt-dlp.exe'yi kapatır; onun
-    başlattığı ffmpeg.exe alt süreci arka planda çalışmaya devam edebilir ve
-    çıktı dosyasını kilitli tutabilir. Bu da iptal sonrası ".part"/".webm"
-    gibi geçici dosyaların silinememesinin başlıca sebebiydi. Windows'ta
-    "taskkill /T" tüm alt süreç ağacını birlikte kapatarak bunu önler.
     """
     try:
         if os.name == 'nt':
@@ -498,25 +526,25 @@ class StatusSpeaker:
         with self._lock:
             if self._last.get(field) != text:
                 self._last[field] = text
-                self.sb.SetStatusText(text, field)
+                try:
+                    if self.sb:
+                        self.sb.SetStatusText(text, field)
+                except Exception:
+                    pass
 
 
 # ── İndirme ögesini temsil eden veri sınıfı ──────────────────────────────────
 class DownloadItem:
     """
     Tek bir indirme kuyruğu ögesini temsil eder.
-
-    NOT: `key` alanı, kuyruk/sözlük anahtarı olarak KULLANILMASI gereken
-    benzersiz kimliktir — `url` DEĞİL. Aynı video adresi (ör. iki farklı
-    playlist'te aynı video geçtiğinde) kuyrukta birden fazla kez oluşabilir;
-    URL'yi anahtar olarak kullanmak bu durumda ögelerin birbirinin üzerine
-    yazılmasına yol açardı. `idx`, ekranda gösterilen sıra numarasıdır ve
-    tekil olması ZORUNLU değildir.
+    item_id benzersiz bir tam sayı kimliktir; satır silinmelerinde bile
+    UI ile motor arasındaki bağı korur.
     """
-    def __init__(self, url: str, idx: int):
+    def __init__(self, url: str, idx: int, item_id: int = None):
         self.url             = url
         self.idx             = idx
-        self.key              = f"{idx}:{id(self)}"
+        self.item_id         = item_id if item_id is not None else idx
+        self.key             = f"{idx}:{id(self)}"
         self.title           = url
         self.status          = "Kuyrukta"
         self.progress        = "0%"
@@ -525,6 +553,7 @@ class DownloadItem:
         self.error           = ""
         self.start_time      = datetime.now().isoformat()
         self.end_time        = None
+        self.removed         = False
         # Playlist alanları (yoksa None)
         self.playlist_title  = None
         self.playlist_idx    = None

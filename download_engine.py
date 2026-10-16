@@ -15,9 +15,11 @@ bir dosyada tutulur ama davranış aynı kalır.
 """
 
 import os
+import re
 import json
 import time
 import random
+import queue
 import threading
 import subprocess
 import wx
@@ -68,6 +70,7 @@ class DownloadEngineMixin:
         ]
         proc = subprocess.run(
             args, capture_output=True, text=True, timeout=60,
+            encoding='utf-8', errors='replace',
             creationflags=CREATE_NO_WINDOW)
         if proc.returncode != 0:
             raise RuntimeError(
@@ -155,46 +158,70 @@ class DownloadEngineMixin:
             return args
 
         if 'FLAC' in fmt:
-            args += ['-f', 'ba/b', '-x', '--audio-format', 'flac']
+            if ffmpeg_path:
+                args += ['-f', 'ba/b', '-x', '--audio-format', 'flac']
+            else:
+                args += ['-f', 'ba/b']
         elif 'Opus' in fmt:
-            args += ['-f', 'ba/b', '-x', '--audio-format', 'opus']
+            if ffmpeg_path:
+                args += ['-f', 'ba/b', '-x', '--audio-format', 'opus']
+            else:
+                args += ['-f', 'ba/b']
         elif 'AAC' in fmt or 'M4A' in fmt:
-            args += ['-f', 'ba/b', '-x', '--audio-format', 'aac',
-                      '--audio-quality', '256K']
+            if ffmpeg_path:
+                args += ['-f', 'ba/b', '-x', '--audio-format', 'aac',
+                          '--audio-quality', '256K']
+            else:
+                args += ['-f', 'ba/b']
         elif 'MP3 320' in fmt:
-            args += ['-f', 'ba/b', '-x', '--audio-format', 'mp3',
-                      '--audio-quality', '320K']
+            if ffmpeg_path:
+                args += ['-f', 'ba/b', '-x', '--audio-format', 'mp3',
+                          '--audio-quality', '320K']
+            else:
+                args += ['-f', 'ba/b']
         elif 'MP3 192' in fmt:
-            args += ['-f', 'ba/b', '-x', '--audio-format', 'mp3',
-                      '--audio-quality', '192K']
+            if ffmpeg_path:
+                args += ['-f', 'ba/b', '-x', '--audio-format', 'mp3',
+                          '--audio-quality', '192K']
+            else:
+                args += ['-f', 'ba/b']
         elif '4K' in fmt or '2160p' in fmt:
             args += ['-f', self._video_format_selector(2160),
-                      '-S', 'res,codec:h264:m4a',
-                      '--merge-output-format', 'mp4']
+                      '-S', 'res,codec:h264:m4a']
+            if ffmpeg_path:
+                args += ['--merge-output-format', 'mp4']
         elif '1440p' in fmt:
             args += ['-f', self._video_format_selector(1440),
-                      '-S', 'res,codec:h264:m4a',
-                      '--merge-output-format', 'mp4']
+                      '-S', 'res,codec:h264:m4a']
+            if ffmpeg_path:
+                args += ['--merge-output-format', 'mp4']
         elif '1080p' in fmt:
             args += ['-f', self._video_format_selector(1080),
-                      '-S', 'res,codec:h264:m4a',
-                      '--merge-output-format', 'mp4']
+                      '-S', 'res,codec:h264:m4a']
+            if ffmpeg_path:
+                args += ['--merge-output-format', 'mp4']
         elif '720p' in fmt:
             args += ['-f', self._video_format_selector(720),
-                      '-S', 'res,codec:h264:m4a',
-                      '--merge-output-format', 'mp4']
+                      '-S', 'res,codec:h264:m4a']
+            if ffmpeg_path:
+                args += ['--merge-output-format', 'mp4']
         elif '480p' in fmt:
             args += ['-f', self._video_format_selector(480),
-                      '-S', 'res,codec:h264:m4a',
-                      '--merge-output-format', 'mp4']
+                      '-S', 'res,codec:h264:m4a']
+            if ffmpeg_path:
+                args += ['--merge-output-format', 'mp4']
         elif 'WebM' in fmt:
             args += ['-f', self._video_format_selector(),
-                      '-S', 'codec:vp9:opus',
-                      '--merge-output-format', 'webm']
+                      '-S', 'codec:vp9:opus']
+            if ffmpeg_path:
+                args += ['--merge-output-format', 'webm']
         else:
-            args += ['-f', self._video_format_selector(),
-                      '-S', 'res,codec:h264:m4a',
-                      '--merge-output-format', 'mp4']
+            if ffmpeg_path:
+                args += ['-f', self._video_format_selector(),
+                          '-S', 'res,codec:h264:m4a',
+                          '--merge-output-format', 'mp4']
+            else:
+                args += ['-f', 'b/bv*+ba/best']
 
         is_audio_fmt = fmt.startswith('Ses')
 
@@ -271,14 +298,19 @@ class DownloadEngineMixin:
             user_template = '%(title)s.%(ext)s'
         if item.playlist_title:
             safe_pl = sanitize_filename_part(item.playlist_title)[:60]
+            idx_prefix = f"{item.playlist_idx:03d} - " if item.playlist_idx is not None else ""
             outtmpl = os.path.join(
                 self.settings['dir'], safe_pl,
-                f"{item.playlist_idx:03d} - {user_template}")
+                f"{idx_prefix}{user_template}")
         else:
             outtmpl = os.path.join(self.settings['dir'], user_template)
 
         # Bu indirmeye ait geçici dosyaların aranacağı klasör (temizlik için)
         target_dir = os.path.dirname(outtmpl) or self.settings['dir']
+        try:
+            os.makedirs(target_dir, exist_ok=True)
+        except Exception:
+            pass
 
         return self._run_attempts(url, item, fmt, outtmpl, target_dir, start_attempt=0)
 
@@ -308,7 +340,9 @@ class DownloadEngineMixin:
                 proc = subprocess.Popen(
                     args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     text=True, bufsize=1, universal_newlines=True,
+                    encoding='utf-8', errors='replace',
                     creationflags=CREATE_NO_WINDOW)
+                self._current_proc = proc
             except Exception as exc:
                 item.error = f"İndirme motoru çalıştırılamadı: {exc}"
                 item.status = "Hata"
@@ -407,13 +441,19 @@ class DownloadEngineMixin:
                 except Exception:
                     pct = 0
                 self._ui_update(self._update_row, item, "İndiriliyor", p, speed, eta, attempt_label)
-                self._ui_update(self.progress_bar.SetValue, pct)
+                tot = getattr(self, '_total_items', 1) or 1
+                cur_done = self._counts.get('done', 0) if hasattr(self, '_counts') else 0
+                overall_pct = int(((cur_done + (pct / 100.0)) / tot) * 100)
+                self._ui_update(self.progress_bar.SetValue, max(0, min(100, overall_pct)))
                 self._ui_update(self.speaker.say, f"{item.title[:30]}  {p}  {speed}", 1)
 
             elif line.startswith("PPROG::"):
                 item.status = "Dönüştürülüyor"
                 self._ui_update(self._update_row, item, "Dönüştürülüyor...", "100%", "", "", attempt_label)
-                self._ui_update(self.progress_bar.SetValue, 100)
+                tot = getattr(self, '_total_items', 1) or 1
+                cur_done = self._counts.get('done', 0) if hasattr(self, '_counts') else 0
+                overall_pct = int(((cur_done + 1.0) / tot) * 100)
+                self._ui_update(self.progress_bar.SetValue, max(0, min(100, overall_pct)))
                 self._ui_update(self.speaker.say, f"Dönüştürülüyor: {item.title[:40]}", 1)
 
                 if self._pp_semaphore.acquire(blocking=False):
@@ -501,7 +541,7 @@ class DownloadEngineMixin:
         err_lines = [l for l in output_lines if l.strip()]
         err_str = err_lines[-1] if err_lines else "Bilinmeyen hata"
 
-        if self._is_429_error(full_output):
+        if attempt < RETRY_MAX - 1 and self._is_429_error(full_output):
             sleep_time = RETRY_BASE_SLEEP * (2 ** attempt) + random.uniform(0, RETRY_JITTER_MAX)
             sleep_time = min(sleep_time, 120)
             msg = (f"429 Too Many Requests — Bekleniyor {sleep_time:.0f}s "
@@ -575,15 +615,20 @@ class DownloadEngineMixin:
                 break
 
             # Playlist mi kontrol et (list= parametresi var mı veya /playlist? yolu)
-            is_playlist_url = ('list=' in url and 'watch?v=' not in url) or '/playlist?' in url
+            list_match = re.search(r'[?&]list=([^&]+)', url)
             is_playlist_enabled = self.settings.get('playlist', False)
+            is_playlist_url = bool(list_match) or '/playlist?' in url
 
             if is_playlist_url and is_playlist_enabled:
-                # Playlist içeriğini düz listele
+                pl_target_url = url
+                if list_match:
+                    pl_id = list_match.group(1)
+                    pl_target_url = f"https://www.youtube.com/playlist?list={pl_id}"
+
                 self._ui_update(self.speaker.say,
                                 f"Oynatma listesi analiz ediliyor: {url[:50]}", 0)
                 try:
-                    info = self._ytdlp_dump_json(url, ua)
+                    info = self._ytdlp_dump_json(pl_target_url, ua)
 
                     if info and info.get('_type') == 'playlist':
                         entries = info.get('entries', [])
@@ -598,13 +643,13 @@ class DownloadEngineMixin:
                                        entry.get('url') or
                                        f"https://www.youtube.com/watch?v={entry.get('id', '')}")
                             if vid_url:
+                                if not vid_url.startswith('http'):
+                                    vid_url = f"https://www.youtube.com/watch?v={vid_url}"
                                 expanded.append((vid_url, pl_title, i + 1, pl_total))
                     else:
-                        # extract_flat bazen direkt video döndürür
                         expanded.append((url, None, None, None))
                 except Exception as exc:
                     self._log_event(f"Playlist analiz hatası: {url[:50]} — {exc}")
-                    # Hata olursa orijinal URL'yi ekle, yt-dlp kendi halleder
                     expanded.append((url, None, None, None))
             else:
                 expanded.append((url, None, None, None))
@@ -627,6 +672,7 @@ class DownloadEngineMixin:
             return
 
         total = len(expanded)
+        self._total_items = total
 
         # ── Eşzamanlılık durumu ────────────────────────────────────────────
         # "Dönüştürülüyor" (ffmpeg postprocess) aşaması ağdan değil CPU'dan
@@ -651,7 +697,8 @@ class DownloadEngineMixin:
                         self.failed_urls.append(url)
                 self._counts['done'] += 1
                 done = self._counts['done']
-            self._ui_update(self.progress_bar.SetValue, int(done / total * 100))
+            tot = getattr(self, '_total_items', total) or 1
+            self._ui_update(self.progress_bar.SetValue, int(done / tot * 100))
 
         # Arka plan thread'lerinin (_spawn_background_finish) erişebilmesi
         # için bir metod referansı olarak saklanır.
@@ -663,7 +710,7 @@ class DownloadEngineMixin:
         time.sleep(0.05)
 
         for idx, (url, pl_title, pl_idx, pl_total) in enumerate(expanded):
-            item = DownloadItem(url, idx)
+            item = DownloadItem(url, idx, item_id=idx)
             # Başlık: playlist ise "PL: Oynatma Listesi  [3/12]" formatında göster
             if pl_title:
                 display = f"[{pl_idx}/{pl_total}] {pl_title[:50]}"
@@ -674,9 +721,7 @@ class DownloadEngineMixin:
             item.playlist_idx   = pl_idx
             item.playlist_total = pl_total
             self.download_items[idx] = item
-            self._ui_update(self.queue_list.InsertItem, idx, display)
-            self._ui_update(self.queue_list.SetItem, idx, 1, "Kuyrukta")
-            self._ui_update(self.queue_list.SetItem, idx, 2, "0%")
+            self._ui_update(self._insert_queue_item, idx, item, display)
 
         time.sleep(0.15)
         summary_prefix = f"Toplam {total} video" + (
@@ -693,22 +738,19 @@ class DownloadEngineMixin:
 
         if parallel_n <= 1:
             # Varsayılan ve ÖNERİLEN davranış: videolar sırayla, aralarında
-            # kısa bir bekleme ile indirilir. Bu, mevcut/eski davranışla
-            # birebir aynıdır — kullanıcı paralel indirmeyi kendisi
-            # açmadığı sürece hiçbir şey değişmez.
+            # kısa bir bekleme ile indirilir.
             for idx, (url, pl_title, pl_idx, pl_total) in enumerate(expanded):
                 if self.stop_event.is_set():
                     self._log_event("Kullanıcı tarafından durduruldu.")
                     break
 
-                item = self.download_items[idx]
+                item = self.download_items.get(idx)
+                if not item or getattr(item, 'removed', False):
+                    continue
+
                 result = self._download_single(url, item, fmt)
 
                 if result == "PENDING":
-                    # Bu videonun dönüştürmesi arka planda sürüyor; sayaçlar ve
-                    # ilerleme çubuğu, o thread bittiğinde on_item_done ile
-                    # otomatik güncellenecek — burada BEKLENMİYOR, kuyruk hemen
-                    # bir sonraki videoya geçiyor.
                     pass
                 else:
                     on_item_done(url, item, bool(result))
@@ -725,48 +767,57 @@ class DownloadEngineMixin:
                             break
                         time.sleep(0.3)
         else:
-            # Kullanıcı, Ayarlar sekmesinden bilinçli olarak "Aynı Anda
-            # İndirilecek Video Sayısı"nı 1'in üzerine çıkardı. En fazla
-            # `parallel_n` video aynı anda indirilir. Her indirmenin başlangıcı
-            # tam olarak aynı ana denk gelmesin diye küçük, rastgele bir
-            # gecikme uygulanır.
+            # Kullanıcı, Ayarlar sekmesinden "Aynı Anda İndirilecek Video Sayısı"nı
+            # artırdığında sabit boyutlu bir worker havuzu kullanılır.
             self._ui_update(
                 self.speaker.say,
                 f"Aynı anda en fazla {parallel_n} video indirilecek.", 0)
 
-            dl_semaphore = threading.BoundedSemaphore(parallel_n)
-            dl_threads = []
+            q = queue.Queue()
+            for idx, (url, pl_title, pl_idx, pl_total) in enumerate(expanded):
+                q.put((idx, url))
 
-            def worker(url, item):
-                dl_semaphore.acquire()
-                try:
+            def worker():
+                while not q.empty() and not self.stop_event.is_set():
+                    try:
+                        idx, url = q.get_nowait()
+                    except queue.Empty:
+                        break
+                    item = self.download_items.get(idx)
+                    if not item or getattr(item, 'removed', False):
+                        q.task_done()
+                        continue
                     if self.stop_event.is_set():
-                        return
-                    time.sleep(random.uniform(0, 2.0))
+                        q.task_done()
+                        break
+                    time.sleep(random.uniform(0, 1.0))
                     if self.stop_event.is_set():
-                        return
+                        q.task_done()
+                        break
                     result = self._download_single(url, item, fmt)
                     if result != "PENDING":
                         on_item_done(url, item, bool(result))
-                finally:
-                    dl_semaphore.release()
+                    q.task_done()
 
-            for idx, (url, pl_title, pl_idx, pl_total) in enumerate(expanded):
-                if self.stop_event.is_set():
-                    self._log_event("Kullanıcı tarafından durduruldu.")
-                    break
-                item = self.download_items[idx]
-                t = threading.Thread(target=worker, args=(url, item), daemon=True)
+            dl_threads = []
+            worker_count = min(parallel_n, total)
+            for _ in range(worker_count):
+                t = threading.Thread(target=worker, daemon=True)
                 dl_threads.append(t)
                 t.start()
 
             for t in dl_threads:
                 t.join()
 
-        # Arka planda hâlâ dönüştürülmekte olan videolar varsa, özet ve
-        # bildirim gösterilmeden önce bitmelerini bekle.
+        # Arka planda hâlâ dönüştürülmekte olan videolar varsa bitmelerini bekle.
         for t in self._pending_threads:
             t.join()
+
+        if self.stop_event.is_set():
+            for item in self.download_items.values():
+                if item.status == "Kuyrukta":
+                    item.status = "İptal Edildi"
+                    self._ui_update(self._update_row, item, "İptal", item.progress, "", "", "")
 
         completed = self._counts['completed']
         failed    = self._counts['failed']
@@ -785,7 +836,7 @@ class DownloadEngineMixin:
                    f"Başarılı: {completed}, Başarısız: {failed}, Toplam: {total}.")
         self._ui_update(self.speaker.say, summary, 0)
         self._log_event(summary)
-        self._save(LOG_FILE, self.log)
+        self._save(LOG_FILE, list(self.log))
 
         if completed > 0:
             msg = (f"{summary}\n\n"

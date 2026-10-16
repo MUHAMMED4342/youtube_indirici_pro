@@ -1,0 +1,27 @@
+# Python önbellekleri
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyInstaller derleme çıktıları
+build/
+dist/
+*.spec.bak
+
+# Inno Setup kurulum çıktıları
+youtube_indirici_pro.setup/
+
+# Büyük ikili ve çalıştırılabilir dosyalar (.exe, FFmpeg vb.)
+*.exe
+*.dll
+*.pyd
+ffmpeg.exe
+ffprobe.exe
+
+# Uygulama yerel çalışma / ayar / günlük dosyaları
+ayarlar.json
+gecmis.json
+islem_gunlugu.json
+indirilen_adresler.json
+kuyruk.json
+*.tmp

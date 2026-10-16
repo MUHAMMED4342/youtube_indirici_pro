@@ -772,16 +772,21 @@ class YouTubeDownloader(wx.Frame, DownloadEngineMixin):
     # OLAY İŞLEYİCİLERİ
     # ─────────────────────────────────────────────────────────────────────────
     def _on_paste(self, event):
-        if wx.TheClipboard.Open():
-            data = wx.TextDataObject()
-            if wx.TheClipboard.GetData(data):
-                text = data.GetText().strip()
-                current = self.url_input.GetValue().strip()
-                sep = "\n" if current else ""
-                self.url_input.SetValue(current + sep + text)
-                self.url_input.SetInsertionPointEnd()
-                self.speaker.say("Pano içeriği URL alanına yapıştırıldı.")
-            wx.TheClipboard.Close()
+        try:
+            if wx.TheClipboard.Open():
+                try:
+                    data = wx.TextDataObject()
+                    if wx.TheClipboard.GetData(data):
+                        text = data.GetText().strip()
+                        current = self.url_input.GetValue().strip()
+                        sep = "\n" if current else ""
+                        self.url_input.SetValue(current + sep + text)
+                        self.url_input.SetInsertionPointEnd()
+                        self.speaker.say("Pano içeriği URL alanına yapıştırıldı.")
+                finally:
+                    wx.TheClipboard.Close()
+        except Exception:
+            pass
 
     def _on_import_file(self, event):
         with wx.FileDialog(
@@ -813,27 +818,27 @@ class YouTubeDownloader(wx.Frame, DownloadEngineMixin):
         if idx == wx.NOT_FOUND:
             bildir(self, "Silmek için önce kuyruktan bir öge seçin.", "Bilgi")
             return
-        if self.active:
-            title = self.queue_list.GetItemText(idx, 0)
-            status = self.queue_list.GetItemText(idx, 1)
-            if status in ("İndiriliyor", "Bağlanıyor...", "Dönüştürülüyor"):
-                bildir(self, "Şu anda indirilmekte olan öge kuyruktan silinemez.",
-                       "Uyarı", wx.ICON_WARNING)
-                return
+        status = self.queue_list.GetItemText(idx, 1)
+        if self.active and status in ("İndiriliyor", "Bağlanıyor...", "Dönüştürülüyor"):
+            bildir(self, "Şu anda indirilmekte olan öge kuyruktan silinemez.",
+                   "Uyarı", wx.ICON_WARNING)
+            return
+        item_id = self.queue_list.GetItemData(idx)
+        for item in self.download_items.values():
+            if item.item_id == item_id:
+                item.removed = True
+                break
         removed_title = self.queue_list.GetItemText(idx, 0)
         self.queue_list.DeleteItem(idx)
         self.speaker.say(f"Kuyruktan silindi: {removed_title[:40]}", 0)
 
     def _on_clear_completed(self, event):
         removed = 0
-        i = 0
-        while i < self.queue_list.GetItemCount():
+        for i in range(self.queue_list.GetItemCount() - 1, -1, -1):
             status = self.queue_list.GetItemText(i, 1)
             if "Tamamlandı" in status:
                 self.queue_list.DeleteItem(i)
                 removed += 1
-            else:
-                i += 1
         self.speaker.say(f"{removed} tamamlanmış öge kuyruktan temizlendi.", 0)
 
     def _on_start(self, event):
@@ -914,7 +919,7 @@ class YouTubeDownloader(wx.Frame, DownloadEngineMixin):
     def _on_cancel(self, event):
         self.stop_event.set()
         self.btn_cancel.Disable()
-        self.speaker.say("İptal sinyali gönderildi. Mevcut indirme tamamlandıktan sonra durulacak.", 0)
+        self.speaker.say("İptal sinyali gönderildi. İndirme durduruluyor.", 0)
 
     def _on_save_settings(self, event):
         mn = self.spin_min.GetValue()
@@ -995,7 +1000,10 @@ class YouTubeDownloader(wx.Frame, DownloadEngineMixin):
     def _apply_ytdlp_progress(self, pct, msg):
         if getattr(self, '_ytdlp_progress_dlg', None):
             self._ytdlp_progress_dlg.set_progress(pct, msg)
-        self.speaker.say(msg, 0)
+        last_spoke = getattr(self, '_last_ytdlp_spoke_pct', -1)
+        if pct is None or (pct != last_spoke and (pct % 10 == 0 or pct in (0, 100))):
+            self._last_ytdlp_spoke_pct = pct
+            self.speaker.say(msg, 0)
 
     def _close_ytdlp_progress_dialog(self):
         dlg = getattr(self, '_ytdlp_progress_dlg', None)
@@ -1036,6 +1044,9 @@ class YouTubeDownloader(wx.Frame, DownloadEngineMixin):
             self.lbl_ytdlp.SetLabel(self._ytdlp_status_text())
 
     def _on_update_ytdlp(self, event):
+        if self.active:
+            bildir(self, "İndirme devam ederken indirme motoru güncellenemez. Lütfen önce indirmelerin bitmesini bekleyin veya iptal edin.", "Uyarı", wx.ICON_WARNING)
+            return
         if self._ytdlp_busy:
             bildir(self, "İndirme motoru şu anda kuruluyor/güncelleniyor, lütfen bekleyin.", "Bilgi")
             return
@@ -1122,11 +1133,21 @@ class YouTubeDownloader(wx.Frame, DownloadEngineMixin):
         self.speaker.say("İşlem günlüğü temizlendi.", 0)
 
     def _on_export_log(self, event):
-        desktop = os.path.join(os.path.expanduser('~'), 'Desktop')
+        home = os.environ.get('USERPROFILE', os.path.expanduser('~'))
+        desktop = os.path.join(home, 'Desktop')
+        if not os.path.exists(desktop):
+            onedrive_desktop = os.path.join(home, 'OneDrive', 'Desktop')
+            if os.path.exists(onedrive_desktop):
+                desktop = onedrive_desktop
+            else:
+                try:
+                    os.makedirs(desktop, exist_ok=True)
+                except Exception:
+                    desktop = home
         fname = f"youtube_indirici_gunluk_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
         fpath = os.path.join(desktop, fname)
         try:
-            lines = [f"[{e['zaman']}] {e['mesaj']}" for e in self.log]
+            lines = [f"[{e['zaman']}] {e['mesaj']}" for e in list(self.log)]
             with open(fpath, 'w', encoding='utf-8') as f:
                 f.write("\n".join(lines))
             bildir(self, f"Günlük masaüstüne kaydedildi:\n{fpath}", "Dışa Aktar")
@@ -1209,12 +1230,9 @@ class YouTubeDownloader(wx.Frame, DownloadEngineMixin):
 
     def _on_queue_keydown(self, event):
         key = event.GetKeyCode()
-        if key == wx.WXK_F5:
-            self._on_read_status(event)
-        elif key == wx.WXK_F6:
-            self._on_retry(event)
-        elif key == wx.WXK_DELETE:
+        if key == wx.WXK_DELETE:
             self._on_remove_selected(event)
+            return
         event.Skip()
 
     def _setup_tray_icon(self):
@@ -1246,6 +1264,11 @@ class YouTubeDownloader(wx.Frame, DownloadEngineMixin):
                 return
             self.stop_event.set()
             dlg.Destroy()
+            if hasattr(self, '_current_proc') and self._current_proc:
+                try:
+                    terminate_process_tree(self._current_proc)
+                except Exception:
+                    pass
         self._clipboard_timer.Stop()
         self._ui_timer.Stop()
         if self.tray_icon:
@@ -1256,17 +1279,22 @@ class YouTubeDownloader(wx.Frame, DownloadEngineMixin):
     def _check_clipboard(self, event):
         if self.active:
             return
-        if wx.TheClipboard.Open():
-            data = wx.TextDataObject()
-            if wx.TheClipboard.GetData(data):
-                text = data.GetText().strip()
-                if is_valid_url(text) and text not in self.url_input.GetValue():
-                    current = self.url_input.GetValue().strip()
-                    sep = "\n" if current else ""
-                    self.url_input.SetValue(current + sep + text)
-                    self.url_input.SetInsertionPointEnd()
-                    self.speaker.say("YouTube adresi otomatik yapıştırıldı.", 0)
-            wx.TheClipboard.Close()
+        try:
+            if wx.TheClipboard.Open():
+                try:
+                    data = wx.TextDataObject()
+                    if wx.TheClipboard.GetData(data):
+                        text = data.GetText().strip()
+                        if is_valid_url(text) and text not in self.url_input.GetValue():
+                            current = self.url_input.GetValue().strip()
+                            sep = "\n" if current else ""
+                            self.url_input.SetValue(current + sep + text)
+                            self.url_input.SetInsertionPointEnd()
+                            self.speaker.say("YouTube adresi otomatik yapıştırıldı.", 0)
+                finally:
+                    wx.TheClipboard.Close()
+        except Exception:
+            pass
 
     # ─────────────────────────────────────────────────────────────────────────
     # THREAD-SAFE UI GÜNCELLEME (Queue tabanlı — NVDA uyumlu)
@@ -1338,6 +1366,10 @@ class YouTubeDownloader(wx.Frame, DownloadEngineMixin):
                 title   = e.get('title', '(Başlık yok)')
                 channel = e.get('uploader') or e.get('channel', '')
                 url     = e.get('webpage_url') or e.get('url', '')
+                if url and not url.startswith('http'):
+                    url = f"https://www.youtube.com/watch?v={url}"
+                elif not url and e.get('id'):
+                    url = f"https://www.youtube.com/watch?v={e.get('id')}"
                 duration = e.get('duration')
                 dur_str = ""
                 if duration:
@@ -1423,14 +1455,25 @@ class YouTubeDownloader(wx.Frame, DownloadEngineMixin):
         lines = [f"[{e['zaman']}] {e['mesaj']}" for e in reversed(self.log)]
         self.log_text.SetValue("\n".join(lines))
 
+    def _insert_queue_item(self, idx, item: DownloadItem, display: str):
+        self.queue_list.InsertItem(idx, display)
+        self.queue_list.SetItemData(idx, item.item_id)
+        self.queue_list.SetItem(idx, 1, "Kuyrukta")
+        self.queue_list.SetItem(idx, 2, "0%")
+
     def _update_row(self, item: DownloadItem, status, prog, speed, eta, attempt=""):
-        i = item.idx
-        self.queue_list.SetItem(i, 0, item.title[:70])
-        self.queue_list.SetItem(i, 1, status)
-        self.queue_list.SetItem(i, 2, prog)
-        self.queue_list.SetItem(i, 3, speed)
-        self.queue_list.SetItem(i, 4, eta)
-        self.queue_list.SetItem(i, 5, str(attempt))
+        row = self.queue_list.FindItem(-1, item.item_id)
+        if row == wx.NOT_FOUND:
+            if item.idx < self.queue_list.GetItemCount() and self.queue_list.GetItemData(item.idx) == item.item_id:
+                row = item.idx
+            else:
+                return
+        self.queue_list.SetItem(row, 0, item.title[:70])
+        self.queue_list.SetItem(row, 1, status)
+        self.queue_list.SetItem(row, 2, prog)
+        self.queue_list.SetItem(row, 3, speed)
+        self.queue_list.SetItem(row, 4, eta)
+        self.queue_list.SetItem(row, 5, str(attempt))
 
     def _log_event(self, message: str):
         entry = {"zaman": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "mesaj": message}
